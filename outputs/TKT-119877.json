@@ -1,0 +1,30 @@
+{
+  "ticket_id": "TKT-119877",
+  "account_id": null,
+  "category": "needs_info",
+  "priority": "P3",
+  "route_to": "L1_support",
+  "escalate": false,
+  "notify_tam": false,
+  "duplicate_of": null,
+  "needs_clarification": true,
+  "kb_references": [],
+  "account_signals": [
+    "Agent could not reach a decision within step limit"
+  ],
+  "customer_reply": "Thank you for reaching out. We need a bit more information to assist you \u2014 could you please provide the specific module, error message, and steps to reproduce?",
+  "internal_note": "Agent exhausted step limit without reaching a confident decision. Needs manual triage.",
+  "confidence": 0.2,
+  "reasoning_trace": [
+    {
+      "step": 1,
+      "action": "llm_error",
+      "observation": "LLM call failed: Error code: 429 - You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/."
+    },
+    {
+      "step": 2,
+      "action": "force_submit",
+      "observation": "Max steps reached, requesting forced final decision"
+    }
+  ]
+}
