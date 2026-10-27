@@ -29,23 +29,26 @@ class LLMClient:
         self.model = model or os.getenv("LLM_MODEL", {
             "ollama": "llama3.1:8b", "anthropic": "claude-sonnet-4-5", "openai": "gpt-4o-mini"}[self.provider])
         self.calls = 0  # simple counter you can report for cost/latency
+        self._client = None
+        if self.provider == "anthropic":
+            import anthropic
+            self._client = anthropic.Anthropic()
+        elif self.provider == "openai":
+            from openai import OpenAI
+            self._client = OpenAI()
 
-    def chat(self, messages: list[dict], system: str | None = None, max_tokens: int = 1024,
+    def chat(self, messages: list[dict], system: str | None = None, max_tokens: int = 900,
              temperature: float = 0.0) -> str:
         """messages: [{"role": "user"|"assistant", "content": str}] -> assistant text."""
         self.calls += 1
         if self.provider == "anthropic":
-            import anthropic
-            client = anthropic.Anthropic()
-            resp = client.messages.create(model=self.model, max_tokens=max_tokens, temperature=temperature,
-                                          system=system or "", messages=messages)
+            resp = self._client.messages.create(model=self.model, max_tokens=max_tokens, temperature=temperature,
+                                                system=system or "", messages=messages)
             return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
         if self.provider == "openai":
-            from openai import OpenAI
-            client = OpenAI()
             msgs = ([{"role": "system", "content": system}] if system else []) + messages
-            resp = client.chat.completions.create(model=self.model, messages=msgs, max_tokens=max_tokens,
-                                                  temperature=temperature)
+            resp = self._client.chat.completions.create(model=self.model, messages=msgs, max_tokens=max_tokens,
+                                                       temperature=temperature)
             return resp.choices[0].message.content or ""
         if self.provider == "ollama":
             host = os.getenv("OLLAMA_HOST", "http://localhost:11434")

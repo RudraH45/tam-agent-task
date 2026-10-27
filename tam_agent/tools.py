@@ -4,6 +4,7 @@ and returns a concise text summary the LLM can reason over.
 The Context object (built once per run) holds all indexed data.
 """
 from __future__ import annotations
+import json
 import re
 from datetime import datetime, timedelta
 from math import log
@@ -15,6 +16,13 @@ from .data import AS_OF_DATE
 # ── helpers ──────────────────────────────────────────────────────────
 
 TODAY = datetime.fromisoformat(AS_OF_DATE)
+
+
+def _parse_datetime(value) -> datetime:
+    try:
+        return datetime.fromisoformat(str(value)) if value else datetime.min
+    except (TypeError, ValueError):
+        return datetime.min
 
 
 def _days_until(date_str: str) -> int | None:
@@ -34,6 +42,38 @@ def _normalize(text: str) -> str:
         if t.endswith(suf):
             t = t[: -len(suf)].strip()
     return t
+
+
+def build_usage_index(usage) -> dict[str, dict]:
+    """Pre-compute the compact usage signal consumed by the agent."""
+    result = {}
+    if not hasattr(usage, "groupby"):
+        return result
+
+    for account_id, rows in usage.groupby("account_id"):
+        rows = rows.sort_values("month")
+        active = rows["active_users"].astype(float).tolist()
+        pct_change = None
+        trend = "unknown"
+        churn_risk = False
+        if len(active) >= 6:
+            previous = sum(active[-6:-3]) / 3
+            recent = sum(active[-3:]) / 3
+            if previous:
+                pct_change = round((recent - previous) / previous * 100, 1)
+                if pct_change < -20:
+                    trend = "declining"
+                elif pct_change > 10:
+                    trend = "growing"
+                else:
+                    trend = "stable"
+                churn_risk = pct_change < -25
+        result[str(account_id)] = {
+            "active_user_pct_change_3mo": pct_change,
+            "trend": trend,
+            "churn_risk": churn_risk,
+        }
+    return result
 
 
 # ── BM25 index (built once) ─────────────────────────────────────────
@@ -98,27 +138,28 @@ def lookup_account(ctx, *, account_id: str = "", domain: str = "",
                    company_name: str = "") -> str:
     """Resolve an account by account_id, domain, or fuzzy company name.
     Returns account details or 'not found'."""
-    accts = ctx.accounts
-
     # 1. Direct ID lookup
     if account_id:
-        row = accts[accts["account_id"] == account_id]
-        if not row.empty:
-            return _format_account(row.iloc[0])
+        row = ctx.account_by_id.get(str(account_id))
+        if row is not None:
+            return _format_account(row)
         return f"No account found with id={account_id}"
 
     # 2. Domain lookup (exact)
     if domain:
-        row = accts[accts["domain"] == domain]
-        if not row.empty:
-            return _format_account(row.iloc[0])
+        row = ctx.account_by_domain.get(str(domain).strip().lower())
+        if row is not None:
+            return _format_account(row)
         return f"No account found with domain={domain}"
 
     # 3. Fuzzy company name
     if company_name:
         norm = _normalize(company_name)
+        exact = ctx.account_by_company_name.get(str(company_name).strip().lower())
+        if exact is not None:
+            return _format_account(exact)
         candidates = []
-        for _, r in accts.iterrows():
+        for r in ctx.account_by_id.values():
             score = SequenceMatcher(None, norm, _normalize(r["company_name"])).ratio()
             if score > 0.55:
                 candidates.append((score, r))
@@ -153,71 +194,45 @@ def _format_account(r) -> str:
 
 
 def get_usage_trend(ctx, *, account_id: str) -> str:
-    """Get 6-month usage trend for an account. Highlights drops >20%."""
-    usage = ctx.usage
-    rows = usage[usage["account_id"] == account_id].sort_values("month")
-    if rows.empty:
-        return f"No usage data for {account_id}"
-
-    lines = ["Month      | Active Users | Docs Processed | Login Rate % | Tickets"]
-    lines.append("-" * 70)
-    for _, r in rows.tail(6).iterrows():
-        lines.append(
-            f"{r['month']}   | {r['active_users']:>12} | {r['documents_processed']:>14} | "
-            f"{r['login_rate_pct']:>12} | {r['tickets_opened']}"
-        )
-
-    # Compute trend over last 3 months vs prior 3 months
-    recent = rows.tail(6)
-    if len(recent) >= 6:
-        last3 = recent.tail(3)["active_users"].mean()
-        prev3 = recent.head(3)["active_users"].mean()
-        if prev3 > 0:
-            pct = (last3 - prev3) / prev3 * 100
-            trend = f"DECLINING ({pct:+.1f}%)" if pct < -20 else (
-                f"GROWING ({pct:+.1f}%)" if pct > 10 else f"STABLE ({pct:+.1f}%)")
-            lines.append(f"\nUser trend (3mo vs prior 3mo): {trend}")
-            if pct < -25:
-                lines.append("[!] ALERT: Active users declined >25% — account risk override may apply per KB-2914")
-    return "\n".join(lines)
+    """Return only the pre-computed usage signals needed for triage."""
+    usage_index = getattr(ctx, "usage_by_account", None)
+    if usage_index is None:
+        usage_index = build_usage_index(ctx.usage)
+    signal = usage_index.get(str(account_id))
+    if signal is None:
+        return json.dumps({"account_id": account_id, "usage": "not_found"}, separators=(",", ":"))
+    return json.dumps({"account_id": account_id, **signal}, separators=(",", ":"))
 
 
 def search_tickets(ctx, *, account_id: str, lookback_days: int = 14,
                    module: str = "", error_code: str = "") -> str:
-    """Search recent tickets for an account. Optionally filter by module/error_code."""
-    tickets = ctx.tickets
-    mask = tickets["account_id"] == account_id
-    if not mask.any():
-        # Try by domain
-        return f"No tickets found for account {account_id}"
+    """Return up to five recent open/pending tickets for an account."""
+    subset = list(getattr(ctx, "tickets_by_account_id", {}).get(str(account_id), []))
+    if not subset:
+        return json.dumps({"account_id": account_id, "tickets": []}, separators=(",", ":"))
 
-    subset = tickets[mask].copy()
-    subset["_created"] = subset["created_at"].apply(
-        lambda x: datetime.fromisoformat(x) if x else datetime.min)
     cutoff = TODAY - timedelta(days=lookback_days)
-    subset = subset[subset["_created"] >= cutoff]
+    module = module.lower()
+    error_code = error_code.upper()
+    matches = []
+    for ticket in subset:
+        status = str(ticket.get("status", ""))
+        if status not in {"open", "pending_customer"}:
+            continue
+        created = _parse_datetime(ticket.get("created_at"))
+        if created < cutoff:
+            continue
+        if module and module not in str(ticket.get("module", "")).lower():
+            continue
+        ticket_error = str(ticket.get("error_code", ""))
+        if error_code and error_code not in ticket_error.upper() and error_code not in str(ticket.get("description", "")).upper():
+            continue
+        matches.append(ticket)
 
-    if module:
-        mod_lower = module.lower()
-        subset = subset[subset["module"].str.lower().str.contains(mod_lower, na=False)]
-    if error_code:
-        ec = error_code.upper()
-        subset = subset[
-            (subset["error_code"].str.upper() == ec) |
-            subset["description"].str.contains(ec, case=False, na=False)
-        ]
-
-    if subset.empty:
-        return f"No matching tickets for {account_id} in last {lookback_days} days"
-
-    subset = subset.sort_values("_created", ascending=False).head(10)
-    lines = [f"Found {len(subset)} recent tickets for {account_id}:"]
-    for _, t in subset.iterrows():
-        lines.append(
-            f"  {t['ticket_id']} | {t['created_at']} | {t['status']} | "
-            f"module={t['module']} | error={t['error_code']} | {t['subject']}"
-        )
-    return "\n".join(lines)
+    matches.sort(key=lambda ticket: _parse_datetime(ticket.get("created_at")), reverse=True)
+    fields = ["ticket_id", "created_at", "module", "error_code", "status", "subject"]
+    payload = [{field: ticket.get(field, "") for field in fields} for ticket in matches[:5]]
+    return json.dumps({"account_id": account_id, "tickets": payload}, separators=(",", ":"))
 
 
 def search_kb(ctx, *, query: str, module: str = "",
@@ -255,17 +270,18 @@ def search_kb(ctx, *, query: str, module: str = "",
     if not results:
         return "No KB articles found."
 
-    lines = [f"Top {len(results)} KB results:"]
-    for art, score in results[:8]:
+    payload = []
+    for art, _score in results[:4]:
         meta = art["meta"]
-        status_flag = " [DEPRECATED]" if meta.get("status") == "deprecated" else ""
-        superseded = f" -> superseded by {meta['superseded_by']}" if meta.get("superseded_by") else ""
-        lines.append(
-            f"  {meta['id']} (score={score}) | {meta.get('title', '')} | "
-            f"module={meta.get('module', '')} | type={meta.get('type', '')} | "
-            f"status={meta.get('status', '')}{status_flag}{superseded}"
-        )
-    return "\n".join(lines)
+        snippet = " ".join(str(art.get("body", "")).split())[:150]
+        payload.append({
+            "id": meta.get("id", ""),
+            "title": meta.get("title", ""),
+            "status": meta.get("status", ""),
+            "superseded_by": meta.get("superseded_by", ""),
+            "snippet": snippet,
+        })
+    return json.dumps({"results": payload}, separators=(",", ":"))
 
 
 def read_kb_article(ctx, *, article_id: str) -> str:
@@ -277,6 +293,9 @@ def read_kb_article(ctx, *, article_id: str) -> str:
     meta = art["meta"]
     lines = [f"=== {meta['id']}: {meta.get('title', '')} ==="]
     lines.append(f"Module: {meta.get('module', '')} | Type: {meta.get('type', '')} | Status: {meta.get('status', '')}")
+    if meta.get("status") == "deprecated" or meta.get("superseded_by"):
+        successor = meta.get("superseded_by") or "unknown"
+        lines.insert(0, f"[WARNING: DEPRECATED. Must read successor article: {successor}]")
     if meta.get("error_codes"):
         ec = meta["error_codes"] if isinstance(meta["error_codes"], list) else [meta["error_codes"]]
         lines.append(f"Error codes: {', '.join(ec)}")
@@ -296,60 +315,52 @@ def check_duplicate(ctx, *, account_id: str, module: str,
                     created_at: str) -> str:
     """Check if a ticket is a duplicate of an existing open/pending ticket
     for the same account, module, and error code within 7 days."""
-    tickets = ctx.tickets
-    mask = (tickets["account_id"] == account_id) & (
-        tickets["status"].isin(["open", "pending_customer"]))
+    subset = [
+        ticket for ticket in getattr(ctx, "tickets_by_account_id", {}).get(str(account_id), [])
+        if str(ticket.get("status", "")) in {"open", "pending_customer"}
+    ]
+    if not subset:
+        return json.dumps({"account_id": account_id, "duplicates": []}, separators=(",", ":"))
 
-    subset = tickets[mask].copy()
-    if subset.empty:
-        return "No open/pending tickets for this account."
-
-    try:
-        ticket_date = datetime.fromisoformat(created_at)
-    except (ValueError, TypeError):
+    ticket_date = _parse_datetime(created_at)
+    if ticket_date == datetime.min:
         ticket_date = TODAY
     window = ticket_date - timedelta(days=7)
 
-    subset["_created"] = subset["created_at"].apply(
-        lambda x: datetime.fromisoformat(x) if x else datetime.min)
-    subset = subset[subset["_created"] >= window]
-    subset = subset[subset["_created"] < ticket_date]
-
-    if subset.empty:
-        return "No potential duplicates found within the 7-day window."
+    subset = [
+        ticket for ticket in subset
+        if window <= _parse_datetime(ticket.get("created_at")) < ticket_date
+    ]
+    if not subset:
+        return json.dumps({"account_id": account_id, "duplicates": []}, separators=(",", ":"))
 
     # Match by module and error code
     candidates = []
     mod_lower = module.lower() if module else ""
     ec_upper = error_code.upper() if error_code else ""
 
-    for _, t in subset.iterrows():
+    for t in subset:
         score = 0
-        if mod_lower and t["module"].lower().find(mod_lower) >= 0:
+        if mod_lower and mod_lower in str(t.get("module", "")).lower():
             score += 2
-        if ec_upper and (t["error_code"].upper() == ec_upper or
-                         ec_upper in t.get("description", "").upper()):
+        if ec_upper and (str(t.get("error_code", "")).upper() == ec_upper or
+                         ec_upper in str(t.get("description", "")).upper()):
             score += 3
         # Check subject similarity
-        if subject and t["subject"]:
-            sim = SequenceMatcher(None, subject.lower(), t["subject"].lower()).ratio()
+        if subject and t.get("subject"):
+            sim = SequenceMatcher(None, subject.lower(), str(t["subject"]).lower()).ratio()
             if sim > 0.6:
                 score += 2
         if score >= 2:
             candidates.append((score, t))
 
-    candidates.sort(key=lambda x: -x[0])
+    candidates.sort(key=lambda x: (x[0], _parse_datetime(x[1].get("created_at"))), reverse=True)
     if not candidates:
-        return "No matching duplicates found (checked module, error code, and subject similarity)."
+        return json.dumps({"account_id": account_id, "duplicates": []}, separators=(",", ":"))
 
-    lines = ["Potential duplicates:"]
-    for score, t in candidates[:5]:
-        lines.append(
-            f"  {t['ticket_id']} | {t['created_at']} | {t['status']} | "
-            f"module={t['module']} | error={t['error_code']} | "
-            f"subject={t['subject']} (match_score={score})"
-        )
-    return "\n".join(lines)
+    fields = ["ticket_id", "created_at", "module", "error_code", "status", "subject"]
+    payload = [{field: ticket.get(field, "") for field in fields} for _score, ticket in candidates[:5]]
+    return json.dumps({"account_id": account_id, "duplicates": payload}, separators=(",", ":"))
 
 
 # ── Tool registry ────────────────────────────────────────────────────
